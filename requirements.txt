@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+gunicorn
+catboost
+pandas
+numpy
+pydantic
