@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware # <--- 1. เพิ่ม import นี้
 from pydantic import BaseModel, Field
 from catboost import CatBoostRegressor
 import pandas as pd
@@ -9,10 +10,22 @@ from typing import List
 app = FastAPI(title="CBB Prediction API (Hybrid Model)")
 
 # =========================================================================
+# 🔴 CORS SETUP (ส่วนที่เพิ่มเข้ามาแก้ปัญหา Failed to fetch)
+# =========================================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # อนุญาตให้ทุกเว็บ (รวมถึง localhost และ vercel) เข้าถึงได้
+    allow_credentials=True,
+    allow_methods=["*"],  # อนุญาตทุก Method (GET, POST, etc.)
+    allow_headers=["*"],  # อนุญาตทุก Header
+)
+# =========================================================================
+
+
+# =========================================================================
 # 1. ⚠️ FEATURE LISTS (CRUCIAL: MUST MATCH TRAINED MODELS)
 # =========================================================================
 
-# List เหล่านี้ได้มาจากโค้ด Colab ที่ดึงชื่อ Feature ที่โมเดลคาดหวัง
 MODEL_FEATURES_ADULT = [
     'Site',
     'Ripeness',
@@ -77,18 +90,26 @@ print("⏳ Loading models...")
 for target in TARGETS:
     safe_name = target.replace(" ", "_")
     try:
+        # พยายามโหลดไฟล์ .cbm (CatBoost)
         path = os.path.join(BASE_DIR, f"cbb_model_{safe_name}.cbm")
+        
+        # เช็คเผื่อกรณีไฟล์ชื่อ .pkl (ถ้ามี)
+        if not os.path.exists(path):
+             path_pkl = os.path.join(BASE_DIR, f"cbb_model_{safe_name}.pkl")
+             if os.path.exists(path_pkl):
+                 path = path_pkl
+
         if os.path.exists(path):
             m = CatBoostRegressor()
             m.load_model(path)
             models[target] = m
-            print(f"   ✅ Loaded: {target} (Features: {len(m.feature_names_)})")
+            print(f"   ✅ Loaded: {target}")
         else:
             print(f"   ⚠️ Not found: {path}")
     except Exception as e:
         print(f"   ❌ Error {target}: {e}")
 
-# 3. กำหนด Input (รับค่าพื้นฐาน + ค่าประวัติย้อนหลัง)
+# 3. กำหนด Input
 class InsectInput(BaseModel):
     # Raw Weather & Host (Current Day Data)
     Site: float = Field(..., description="ความสูง (Altitude) ของ Site ปัจจุบัน")
@@ -97,35 +118,33 @@ class InsectInput(BaseModel):
     Humidity: float = Field(..., description="Average Humidity (%) ณ วันนี้")
     Rain: float = Field(..., description="Sum of Rain (mm) ณ วันนี้")
     
-    # Required Lag Features (ค่า Log(x+1) ที่ผู้ใช้ต้องเตรียมมา)
+    # Required Lag Features
     Parent_Mean_7d: float = Field(..., description="ค่าเฉลี่ย Log(Parent + 1) ของ Target จาก 7 วันก่อน")
     Target_Mean_7d: float = Field(..., description="ค่าเฉลี่ย Log(Target + 1) ของ Target จาก 7 วันก่อน")
     Target_Mean_14d: float = Field(..., description="ค่าเฉลี่ย Log(Target + 1) ของ Target จาก 14 วันก่อน")
     
-    # History Data for Rolling Window Calculation (Lists of Past Days)
-    History_Rain: List[float] = Field(..., description="Rain (mm) ย้อนหลัง 14 วัน (วันล่าสุดอยู่ซ้ายสุด [D-1, D-2, ...])")
-    History_Humidity: List[float] = Field(..., description="Humidity (%) ย้อนหลัง 7 วัน (วันล่าสุดอยู่ซ้ายสุด [D-1, D-2, ...])")
-    History_Larvae_Log: List[float] = Field(..., description="Larvae Alive Log(N+1) ย้อนหลัง 20 วัน (สำหรับคำนวณ Larvae_To_Pupae)")
-    History_Pupae_Log: List[float] = Field(..., description="Pupae Alive Log(N+1) ย้อนหลัง 10 วัน (สำหรับคำนวณ Total Adult Stock)")
-    History_Adult_Log: List[float] = Field(..., description="Adult Log(N+1) ย้อนหลัง 60 วัน (สำหรับคำนวณ Total Adult Stock)")
+    # History Data for Rolling Window Calculation
+    History_Rain: List[float] = Field(..., description="Rain (mm) ย้อนหลัง")
+    History_Humidity: List[float] = Field(..., description="Humidity (%) ย้อนหลัง")
+    History_Larvae_Log: List[float] = Field(..., description="Larvae Alive Log(N+1) ย้อนหลัง")
+    History_Pupae_Log: List[float] = Field(..., description="Pupae Alive Log(N+1) ย้อนหลัง")
+    History_Adult_Log: List[float] = Field(..., description="Adult Log(N+1) ย้อนหลัง")
 
 
 # -------------------------------------------------------------------------
-# --- HELPER 1: คำนวณ FEATURES ที่ต้องใช้ ROLLING WINDOW (แก้ปัญหา Sum on Bool)
+# --- HELPER 1: คำนวณ FEATURES ที่ต้องใช้ ROLLING WINDOW
 # -------------------------------------------------------------------------
 
 def calculate_rolling_features(current_R, current_H, hist_R, hist_H):
     """Calculates all necessary Rolling Window Features"""
     
-    # Reverse และรวมค่าวันนี้เข้าไปใน List History
     hist_R_full = hist_R[::-1] + [current_R] 
     hist_H_full = hist_H[::-1] + [current_H]
 
-    # ใช้ pd.Series เพื่อความปลอดภัยในการทำ Slicing/Rolling
     series_rain = pd.Series(hist_R_full)
     series_humid = pd.Series(hist_H_full)
     
-    # 1. Humidity Features (ใช้ข้อมูลย้อนหลัง 7 วัน: Index -8 ถึง -1)
+    # 1. Humidity Features
     if len(series_humid) < 8:
         H_window_7 = pd.Series([0.0] * 7)
     else:
@@ -136,14 +155,12 @@ def calculate_rolling_features(current_R, current_H, hist_R, hist_H):
     Too_Wet_Days = (H_window_7[-3:] >= 98).sum()
 
     # 2. Rain Features
-    # Rain Roll 14 (Cumulative Rain 14 days)
     if len(series_rain) < 15:
         R_roll_window = pd.Series([0.0] * 14)
     else:
         R_roll_window = series_rain.iloc[-15:-1]
     Rain_Roll14 = R_roll_window.sum()
     
-    # Rain Trigger Logic: (ฝนเมื่อวาน > 2) AND (ฝนสะสม 3 วันก่อนหน้า < 1)
     if len(series_rain) >= 5:
         rain_yesterday = series_rain.iloc[-2]
         rain_prev_3d = series_rain.iloc[-5:-2].sum()
@@ -151,7 +168,6 @@ def calculate_rolling_features(current_R, current_H, hist_R, hist_H):
     else:
         Rain_Trigger = 0 
     
-    # Return as int/float explicitly
     return {
         'Humid_Optimal_Days': int(Humid_Optimal_Days),
         'Humid_Stress_Days': int(Humid_Stress_Days),
@@ -162,7 +178,7 @@ def calculate_rolling_features(current_R, current_H, hist_R, hist_H):
 
 
 # -------------------------------------------------------------------------
-# --- HELPER 2: คำนวณ Features ทั้งหมด (รวม Stage Transition)
+# --- HELPER 2: คำนวณ Features ทั้งหมด
 # -------------------------------------------------------------------------
 
 def calculate_all_features(data: InsectInput, target_name: str):
@@ -171,19 +187,18 @@ def calculate_all_features(data: InsectInput, target_name: str):
     T, H, R, Site = data.Temperature, data.Humidity, data.Rain, data.Site
     Parent_Mean_7d = data.Parent_Mean_7d
     
-    # 1. Calculate Environmental Rolling Features (แยกทำใน Helper Function)
+    # 1. Calculate Environmental Rolling Features
     rolling_features = calculate_rolling_features(R, H, data.History_Rain, data.History_Humidity)
     
     # 2. Calculate Derived Features
     Altitude_Risk = np.clip((1600 - Site) / (1600 - 800), 0, 1)
     Alt_x_Temp = Altitude_Risk * T
     
-    # Fungal Pressure Logic (ต้องการใช้ค่า T, H ณ วันนี้ และ Hist H)
-    Fungal_Pressure = 0 # เนื่องจาก Fungal Pressure คำนวณซับซ้อน (Rolling + Temp), เราใช้ 0 เพื่อให้ API ไม่ Crash
+    Fungal_Pressure = 0 
 
-    # 3. Stage Transition Features (Complex Logics)
+    # 3. Stage Transition Features
     
-    # Larvae To Pupae (Need Larvae Log 10-20 days ago)
+    # Larvae To Pupae
     Larvae_To_Pupae = 0
     if target_name in ['Pupae Alive', 'Adult']:
         Larvae_hist = pd.Series(data.History_Larvae_Log[::-1])
@@ -191,7 +206,7 @@ def calculate_all_features(data: InsectInput, target_name: str):
             Larvae_To_Pupae = Larvae_hist.iloc[-24:-14].mean() 
         else: Larvae_To_Pupae = 0.0
 
-    # Total Adult Stock & Flight (Need Adult Log 60d, Pupae Log 10d)
+    # Total Adult Stock & Flight
     Total_Adult_Stock = 0
     Flight_Activity = 0
     if target_name == 'Adult':
@@ -209,22 +224,20 @@ def calculate_all_features(data: InsectInput, target_name: str):
         Total_Adult_Stock = New_Born + (Old_Population * 0.8)
         Flight_Activity = Total_Adult_Stock * rolling_features['Rain_Trigger']
 
-    # Pupae Potential & Survival (Used by Pupae Alive)
+    # Pupae Potential & Survival
     Pupae_Potential = 0
     Survival_Rate = 1.0
     if target_name == 'Pupae Alive':
-        # Survival Rate (Rot Risk) - ใช้ค่า Rolling ที่คำนวณแล้ว
         Rot_Risk = (rolling_features['Humid_Optimal_Days'] >= 3) or (rolling_features['Rain_Roll14'] > 150)
         Survival_Rate = 0.2 if Rot_Risk else 1.0
-        
         Pupae_Potential = Larvae_To_Pupae * Survival_Rate
     
-    # Larvae Potential (Used by Larvae Alive)
+    # Larvae Potential
     Larvae_Potential = 0
     if target_name == 'Larvae Alive':
-        Larvae_Potential = Parent_Mean_7d * 5 # Approximation (ใช้ Parent_Mean_7d แทน Egg Stock)
+        Larvae_Potential = Parent_Mean_7d * 5
 
-    # Egg Survival Potential (Used by Eggs)
+    # Egg Survival Potential
     Egg_Survival_Potential = 0
     if target_name == 'Eggs':
         Egg_Survival_Potential = Parent_Mean_7d / (1 + Fungal_Pressure)
@@ -276,6 +289,10 @@ def get_feature_list(target_name):
         return MODEL_FEATURES_EGGS
     return [] 
 
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "CBB Prediction API is running!"}
+
 @app.post("/predict/{target_name}")
 def predict(target_name: str, data: InsectInput):
     if target_name not in models:
@@ -285,20 +302,20 @@ def predict(target_name: str, data: InsectInput):
         # 1. คำนวณ Features ทั้งหมด
         row_data = calculate_all_features(data, target_name)
 
-        # 2. ดึง List Feature ที่ถูกต้องจากโมเดลที่โหลดจริง
+        # 2. ดึง List Feature ที่ถูกต้อง
         current_model_features = models[target_name].feature_names_
         if not current_model_features or len(current_model_features) == 0:
              current_model_features = get_feature_list(target_name)
 
-        # 3. สร้าง DataFrame และบังคับเรียงลำดับ column
+        # 3. สร้าง DataFrame
         df = pd.DataFrame([row_data])
         
         # 4. Filter and reorder columns
         for col in current_model_features:
              if col not in df.columns:
-                 df[col] = 0.0 # เติม 0 ให้ Feature ที่ถูกคาดหวังแต่ไม่ได้ถูกคำนวณ (เช่น Fungal Pressure)
+                 df[col] = 0.0 
         
-        df = df[current_model_features] # Filter and Reorder!
+        df = df[current_model_features] 
         
         # 5. ทำนาย
         pred_log = models[target_name].predict(df)
@@ -307,9 +324,14 @@ def predict(target_name: str, data: InsectInput):
         return {
             "target": target_name,
             "prediction": round(pred_count, 2),
-            "note": "Prediction successful using full historical context."
+            "note": "Prediction successful."
         }
 
     except Exception as e:
-        # Catch any unexpected errors during processing
+        print(f"Error processing {target_name}: {e}") # Log error ใน console ของ Render
         raise HTTPException(500, detail=f"Prediction Error: {str(e)}")
+
+# (Optional) For Local Testing without command line
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
